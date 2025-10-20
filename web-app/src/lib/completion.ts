@@ -38,12 +38,19 @@ import { ExtensionManager } from './extension'
 import { useAppState } from '@/hooks/useAppState'
 import { injectFilesIntoPrompt } from './fileMetadata'
 import { Attachment } from '@/types/attachment'
+import { ReasoningProcessor } from '@/utils/reasoning'
 
 export type ChatCompletionResponse =
   | chatCompletion
   | AsyncIterable<chatCompletionChunk>
   | StreamCompletionResponse
   | CompletionResponse
+
+type ToolCallEntry = {
+  tool: object
+  response: any
+  state: 'pending' | 'ready'
+}
 
 /**
  * @fileoverview Helper functions for creating thread content.
@@ -70,11 +77,14 @@ export const newUserThreadContent = (
       name: doc.name,
       type: doc.fileType,
       size: typeof doc.size === 'number' ? doc.size : undefined,
-      chunkCount: typeof doc.chunkCount === 'number' ? doc.chunkCount : undefined,
+      chunkCount:
+        typeof doc.chunkCount === 'number' ? doc.chunkCount : undefined,
     }))
 
   const textWithFiles =
-    docMetadata.length > 0 ? injectFilesIntoPrompt(content, docMetadata) : content
+    docMetadata.length > 0
+      ? injectFilesIntoPrompt(content, docMetadata)
+      : content
 
   const contentParts = [
     {
@@ -236,7 +246,10 @@ export const sendCompletion = async (
   try {
     const attachmentsEnabled = useAttachments.getState().enabled
     if (attachmentsEnabled && PlatformFeatures[PlatformFeature.ATTACHMENTS]) {
-      const ragTools = await getServiceHub().rag().getTools().catch(() => [])
+      const ragTools = await getServiceHub()
+        .rag()
+        .getTools()
+        .catch(() => [])
       if (Array.isArray(ragTools) && ragTools.length) {
         usableTools = [...tools, ...ragTools]
       }
@@ -378,6 +391,9 @@ export const extractToolCall = (
   return calls
 }
 
+// Keep track of total tool steps to prevent infinite loops
+let toolStepCounter = 0
+
 /**
  * @fileoverview Helper function to process the completion response.
  * @param calls
@@ -399,10 +415,22 @@ export const postMessageProcessing = async (
     threadId: string,
     toolParameters?: object
   ) => Promise<boolean>,
-  allowAllMCPPermissions: boolean = false
-) => {
+  allowAllMCPPermissions: boolean = false,
+  thread?: Thread,
+  provider?: ModelProvider,
+  tools: MCPTool[] = [],
+  updateStreamingUI?: (content: ThreadMessage) => void,
+  maxToolSteps: number = 20
+): Promise<ThreadMessage> => {
+  // Reset counter at the start of a new message processing chain
+  if (toolStepCounter === 0) {
+    toolStepCounter = 0
+  }
+
   // Handle completed tool calls
-  if (calls.length) {
+  if (calls.length > 0) {
+    toolStepCounter++
+
     // Fetch RAG tool names from RAG service
     let ragToolNames = new Set<string>()
     try {
@@ -412,43 +440,42 @@ export const postMessageProcessing = async (
       console.error('Failed to load RAG tool names:', e)
     }
     const ragFeatureAvailable =
-      useAttachments.getState().enabled && PlatformFeatures[PlatformFeature.ATTACHMENTS]
+      useAttachments.getState().enabled &&
+      PlatformFeatures[PlatformFeature.ATTACHMENTS]
+
+    const currentToolCalls =
+      message.metadata?.tool_calls &&
+      Array.isArray(message.metadata.tool_calls)
+        ? [...message.metadata.tool_calls]
+        : []
+
     for (const toolCall of calls) {
       if (abortController.signal.aborted) break
       const toolId = ulid()
-      const toolCallsMetadata =
-        message.metadata?.tool_calls &&
-        Array.isArray(message.metadata?.tool_calls)
-          ? message.metadata?.tool_calls
-          : []
+
+      const toolCallEntry: ToolCallEntry = {
+        tool: {
+          ...(toolCall as object),
+          id: toolId,
+        },
+        response: undefined,
+        state: 'pending' as 'pending' | 'ready',
+      }
+      currentToolCalls.push(toolCallEntry)
+
       message.metadata = {
         ...(message.metadata ?? {}),
-        tool_calls: [
-          ...toolCallsMetadata,
-          {
-            tool: {
-              ...(toolCall as object),
-              id: toolId,
-            },
-            response: undefined,
-            state: 'pending',
-          },
-        ],
+        tool_calls: currentToolCalls,
       }
+      if (updateStreamingUI) updateStreamingUI({ ...message }) // Show pending call
 
       // Check if tool is approved or show modal for approval
       let toolParameters = {}
       if (toolCall.function.arguments.length) {
         try {
-          console.log('Raw tool arguments:', toolCall.function.arguments)
           toolParameters = JSON.parse(toolCall.function.arguments)
-          console.log('Parsed tool parameters:', toolParameters)
         } catch (error) {
           console.error('Failed to parse tool arguments:', error)
-          console.error(
-            'Raw arguments that failed:',
-            toolCall.function.arguments
-          )
         }
       }
 
@@ -456,7 +483,6 @@ export const postMessageProcessing = async (
       const toolArgs = toolCall.function.arguments.length ? toolParameters : {}
       const isRagTool = ragToolNames.has(toolName)
 
-      // Auto-approve RAG tools (local/safe operations), require permission for MCP tools
       const approved = isRagTool
         ? true
         : allowAllMCPPermissions ||
@@ -472,7 +498,11 @@ export const postMessageProcessing = async (
       const { promise, cancel } = isRagTool
         ? ragFeatureAvailable
           ? {
-              promise: getServiceHub().rag().callTool({ toolName, arguments: toolArgs, threadId: message.thread_id }),
+              promise: getServiceHub().rag().callTool({
+                toolName,
+                arguments: toolArgs,
+                threadId: message.thread_id,
+              }),
               cancel: async () => {},
             }
           : {
@@ -495,18 +525,15 @@ export const postMessageProcessing = async (
       useAppState.getState().setCancelToolCall(cancel)
 
       let result = approved
-        ? await promise.catch((e) => {
-            console.error('Tool call failed:', e)
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `Error calling tool ${toolCall.function.name}: ${e.message ?? e}`,
-                },
-              ],
-              error: String(e?.message ?? e ?? 'Tool call failed'),
-            }
-          })
+        ? await promise.catch((e) => ({
+            content: [
+              {
+                type: 'text',
+                text: `Error calling tool ${toolCall.function.name}: ${e.message ?? e}`,
+              },
+            ],
+            error: String(e?.message ?? e ?? 'Tool call failed'),
+          }))
         : {
             content: [
               {
@@ -519,33 +546,109 @@ export const postMessageProcessing = async (
 
       if (typeof result === 'string') {
         result = {
-          content: [
-            {
-              type: 'text',
-              text: result,
-            },
-          ],
+          content: [{ type: 'text', text: result }],
           error: '',
         }
       }
 
-      message.metadata = {
-        ...(message.metadata ?? {}),
-        tool_calls: [
-          ...toolCallsMetadata,
-          {
-            tool: {
-              ...toolCall,
-              id: toolId,
-            },
-            response: result,
-            state: 'ready',
-          },
-        ],
-      }
+      // Update the entry in the metadata array
+      toolCallEntry.response = result
+      toolCallEntry.state = 'ready'
+      if (updateStreamingUI) updateStreamingUI({ ...message }) // Show result
+
       builder.addToolMessage(result.content[0]?.text ?? '', toolCall.id)
-      // update message metadata
     }
-    return message
+
+    if (
+      thread &&
+      provider &&
+      !abortController.signal.aborted &&
+      toolStepCounter < maxToolSteps
+    ) {
+      try {
+        const messagesWithToolResults = builder.getMessages()
+
+        const followUpCompletion = await sendCompletion(
+          thread,
+          provider,
+          messagesWithToolResults,
+          abortController,
+          tools,
+          true,
+          {}
+        )
+
+        if (followUpCompletion) {
+          let followUpText = ''
+          const newToolCalls: ChatCompletionMessageToolCall[] = []
+          const textContent = message.content.find(
+            (c) => c.type === ContentType.Text
+          )
+
+          if (isCompletionResponse(followUpCompletion)) {
+            const choice = followUpCompletion.choices[0]
+            const content = choice?.message?.content
+            if (content) followUpText = content as string
+            if (choice?.message?.tool_calls) {
+              newToolCalls.push(...choice.message.tool_calls)
+            }
+            if (textContent?.text) textContent.text.value += followUpText
+            if (updateStreamingUI) updateStreamingUI({ ...message })
+          } else {
+            const reasoningProcessor = new ReasoningProcessor()
+            for await (const chunk of followUpCompletion) {
+              if (abortController.signal.aborted) break
+
+              const deltaReasoning =
+                reasoningProcessor.processReasoningChunk(chunk)
+              const deltaContent = chunk.choices[0]?.delta?.content || ''
+
+              if (textContent?.text) {
+                if (deltaReasoning) textContent.text.value += deltaReasoning
+                if (deltaContent) textContent.text.value += deltaContent
+              }
+              if (deltaContent) followUpText += deltaContent
+
+              if (chunk.choices[0]?.delta?.tool_calls) {
+                extractToolCall(chunk, null, newToolCalls)
+              }
+
+              if (updateStreamingUI) updateStreamingUI({ ...message })
+            }
+            if (textContent?.text) {
+              textContent.text.value += reasoningProcessor.finalize()
+              if (updateStreamingUI) updateStreamingUI({ ...message })
+            }
+          }
+
+          if (newToolCalls.length > 0) {
+            builder.addAssistantMessage(followUpText, undefined, newToolCalls)
+            await postMessageProcessing(
+              newToolCalls,
+              builder,
+              message,
+              abortController,
+              approvedTools,
+              showModal,
+              allowAllMCPPermissions,
+              thread,
+              provider,
+              tools,
+              updateStreamingUI,
+              maxToolSteps
+            )
+          }
+        }
+      } catch (error) {
+        console.error(
+          'Failed to get follow-up completion after tool execution:',
+          String(error)
+        )
+      }
+    }
   }
+
+  // Reset counter when the chain is fully resolved
+  toolStepCounter = 0
+  return message
 }
