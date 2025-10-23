@@ -57,6 +57,7 @@ Download from [jan.ai](https://jan.ai/) or [GitHub Releases](https://github.com/
 - **Custom Assistants**: Create specialized AI assistants for your tasks
 - **OpenAI-Compatible API**: Local server at `localhost:1337` for other applications
 - **Model Context Protocol**: MCP integration for agentic capabilities
+- **OpenCog Orchestration**: Autonomous task planning and execution with cognitive AI capabilities
 - **Privacy First**: Everything runs locally when you want it to
 
 ## Build from Source
