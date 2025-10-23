@@ -1,0 +1,3 @@
+{
+  "extends": "../assistant-extension/tsconfig.json"
+}
