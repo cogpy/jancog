@@ -1,0 +1,173 @@
+name: Publish NPM Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to publish'
+        required: true
+        type: choice
+        options:
+          - all
+          - core
+          - extensions-web
+        default: all
+      version:
+        description: 'Version (leave empty to use package.json version)'
+        required: false
+        type: string
+      tag:
+        description: 'NPM tag'
+        required: false
+        type: choice
+        options:
+          - latest
+          - beta
+          - next
+        default: latest
+
+  push:
+    tags:
+      - '@janhq/core@*'
+      - '@jan/extensions-web@*'
+
+env:
+  NODE_OPTIONS: '--max-old-space-size=4096'
+
+jobs:
+  publish-core:
+    name: Publish @janhq/core
+    runs-on: ubuntu-latest
+    if: inputs.package == 'all' || inputs.package == 'core' || startsWith(github.ref, 'refs/tags/@janhq/core@')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build Core
+        run: yarn build:core
+
+      - name: Run Tests
+        run: yarn workspace @janhq/core test
+
+      - name: Set version
+        if: inputs.version != ''
+        working-directory: core
+        run: npm version ${{ inputs.version }} --no-git-tag-version --allow-same-version
+
+      - name: Publish to NPM
+        working-directory: core
+        run: npm publish --access public --tag ${{ inputs.tag || 'latest' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Generate Summary
+        run: |
+          VERSION=$(node -p "require('./core/package.json').version")
+          echo "## Published @janhq/core" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ inputs.tag || 'latest' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View on NPM](https://www.npmjs.com/package/@janhq/core)" >> $GITHUB_STEP_SUMMARY
+
+  publish-extensions-web:
+    name: Publish @jan/extensions-web
+    runs-on: ubuntu-latest
+    if: inputs.package == 'all' || inputs.package == 'extensions-web' || startsWith(github.ref, 'refs/tags/@jan/extensions-web@')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build Core
+        run: yarn build:core
+
+      - name: Build Extensions Web
+        run: yarn build:extensions-web
+
+      - name: Set version
+        if: inputs.version != ''
+        working-directory: extensions-web
+        run: npm version ${{ inputs.version }} --no-git-tag-version --allow-same-version
+
+      - name: Publish to NPM
+        working-directory: extensions-web
+        run: npm publish --access public --tag ${{ inputs.tag || 'latest' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        continue-on-error: true
+
+      - name: Generate Summary
+        run: |
+          VERSION=$(node -p "require('./extensions-web/package.json').version")
+          echo "## Published @jan/extensions-web" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ inputs.tag || 'latest' }}" >> $GITHUB_STEP_SUMMARY
+
+  publish-extensions:
+    name: Build Extension Packages
+    runs-on: ubuntu-latest
+    if: inputs.package == 'all'
+    strategy:
+      fail-fast: false
+      matrix:
+        extension:
+          - opencog-extension
+          - llamacpp-extension
+          - assistant-extension
+          - conversational-extension
+          - download-extension
+          - rag-extension
+          - vector-db-extension
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yarn build:core
+          cd extensions && yarn install
+
+      - name: Build extension
+        working-directory: extensions/${{ matrix.extension }}
+        run: yarn build:publish
+
+      - name: Upload extension package
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ matrix.extension }}
+          path: extensions/${{ matrix.extension }}/*.tgz
+          retention-days: 30

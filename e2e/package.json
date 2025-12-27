@@ -1,0 +1,24 @@
+{
+  "name": "@janhq/e2e-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end tests for Jan AI application",
+  "scripts": {
+    "test": "playwright test",
+    "test:chromium": "playwright test --project=chromium",
+    "test:firefox": "playwright test --project=firefox",
+    "test:webkit": "playwright test --project=webkit",
+    "test:mobile": "playwright test --project=mobile-chrome --project=mobile-safari",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:ui": "playwright test --ui",
+    "test:report": "playwright show-report",
+    "test:trace": "playwright show-trace",
+    "codegen": "playwright codegen http://localhost:3001"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.2"
+  }
+}

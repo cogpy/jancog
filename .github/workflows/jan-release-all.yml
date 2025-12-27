@@ -1,0 +1,305 @@
+name: Release All Platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.6.600)'
+        required: true
+        type: string
+      channel:
+        description: 'Release channel'
+        required: true
+        type: choice
+        options:
+          - stable
+          - beta
+          - nightly
+        default: stable
+      create_release:
+        description: 'Create GitHub release'
+        required: true
+        type: boolean
+        default: true
+      publish_npm:
+        description: 'Publish to NPM'
+        required: false
+        type: boolean
+        default: false
+
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+
+env:
+  NODE_OPTIONS: '--max-old-space-size=4096'
+
+jobs:
+  # Pre-release checks
+  pre-release-checks:
+    name: Pre-Release Checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      channel: ${{ steps.get-channel.outputs.channel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get channel
+        id: get-channel
+        run: |
+          VERSION="${{ steps.get-version.outputs.version }}"
+          if [[ "$VERSION" == *"-beta"* ]]; then
+            echo "channel=beta" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" == *"-rc"* ]]; then
+            echo "channel=beta" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "channel=${{ inputs.channel }}" >> $GITHUB_OUTPUT
+          else
+            echo "channel=stable" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Verify build
+        run: |
+          yarn install
+          yarn build:core
+          yarn test
+
+  # Create GitHub Release
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [pre-release-checks]
+    if: github.event_name == 'push' || inputs.create_release
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_id: ${{ steps.create_release.outputs.id }}
+    permissions:
+      contents: write
+    steps:
+      - name: Create Draft Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.pre-release-checks.outputs.version }}
+          name: v${{ needs.pre-release-checks.outputs.version }}
+          draft: true
+          prerelease: ${{ needs.pre-release-checks.outputs.channel != 'stable' }}
+          generate_release_notes: true
+
+  # Build Desktop Apps
+  build-macos:
+    name: Build macOS (Universal)
+    needs: [pre-release-checks, create-release]
+    uses: ./.github/workflows/template-tauri-build-macos.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.ref }}
+      public_provider: github
+      channel: ${{ needs.pre-release-checks.outputs.channel }}
+      new_version: ${{ needs.pre-release-checks.outputs.version }}
+      upload_url: ${{ needs.create-release.outputs.upload_url }}
+
+  build-windows:
+    name: Build Windows (x64)
+    needs: [pre-release-checks, create-release]
+    uses: ./.github/workflows/template-tauri-build-windows-x64.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.ref }}
+      public_provider: github
+      channel: ${{ needs.pre-release-checks.outputs.channel }}
+      new_version: ${{ needs.pre-release-checks.outputs.version }}
+      upload_url: ${{ needs.create-release.outputs.upload_url }}
+
+  build-linux:
+    name: Build Linux (x64)
+    needs: [pre-release-checks, create-release]
+    uses: ./.github/workflows/template-tauri-build-linux-x64.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.ref }}
+      public_provider: github
+      channel: ${{ needs.pre-release-checks.outputs.channel }}
+      new_version: ${{ needs.pre-release-checks.outputs.version }}
+      upload_url: ${{ needs.create-release.outputs.upload_url }}
+
+  # Build Web App
+  build-web:
+    name: Build Web App
+    runs-on: ubuntu-latest
+    needs: [pre-release-checks]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build Core
+        run: yarn build:core
+
+      - name: Build Extensions Web
+        run: yarn build:extensions-web
+
+      - name: Build Web App
+        run: yarn workspace @janhq/web-app build:web
+
+      - name: Create archive
+        run: |
+          cd web-app/dist-web
+          tar -czvf ../jan-web-app-${{ needs.pre-release-checks.outputs.version }}.tar.gz .
+          cd ..
+          zip -r jan-web-app-${{ needs.pre-release-checks.outputs.version }}.zip dist-web/
+
+      - name: Upload Web App artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-app-dist
+          path: |
+            web-app/jan-web-app-*.tar.gz
+            web-app/jan-web-app-*.zip
+          retention-days: 30
+
+      - name: Upload to Release
+        if: needs.create-release.outputs.upload_url != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v${{ needs.pre-release-checks.outputs.version }} \
+            web-app/jan-web-app-${{ needs.pre-release-checks.outputs.version }}.tar.gz \
+            web-app/jan-web-app-${{ needs.pre-release-checks.outputs.version }}.zip \
+            --clobber
+
+  # Publish NPM Packages
+  publish-npm:
+    name: Publish NPM Packages
+    runs-on: ubuntu-latest
+    needs: [pre-release-checks]
+    if: inputs.publish_npm || (github.event_name == 'push' && !contains(github.ref, 'beta') && !contains(github.ref, 'rc'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build Core
+        run: yarn build:core
+
+      - name: Publish @janhq/core
+        working-directory: core
+        run: |
+          npm version ${{ needs.pre-release-checks.outputs.version }} --no-git-tag-version --allow-same-version
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        continue-on-error: true
+
+  # Create Update Manifest
+  create-update-manifest:
+    name: Create Update Manifest
+    runs-on: ubuntu-latest
+    needs: [pre-release-checks, create-release, build-macos, build-windows, build-linux]
+    if: always() && needs.create-release.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create latest.json
+        run: |
+          VERSION=${{ needs.pre-release-checks.outputs.version }}
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+
+          cat > latest.json << EOF
+          {
+            "version": "$VERSION",
+            "notes": "Release $VERSION",
+            "pub_date": "$PUB_DATE",
+            "platforms": {
+              "linux-x86_64": {
+                "signature": "${{ needs.build-linux.outputs.APPIMAGE_SIG || '' }}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v$VERSION/${{ needs.build-linux.outputs.APPIMAGE_FILE_NAME || 'jan-linux-x86_64.AppImage' }}"
+              },
+              "windows-x86_64": {
+                "signature": "${{ needs.build-windows.outputs.WIN_SIG || '' }}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v$VERSION/${{ needs.build-windows.outputs.FILE_NAME || 'jan-win-x64.exe' }}"
+              },
+              "darwin-aarch64": {
+                "signature": "${{ needs.build-macos.outputs.MAC_UNIVERSAL_SIG || '' }}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v$VERSION/${{ needs.build-macos.outputs.TAR_NAME || 'jan-mac-universal.tar.gz' }}"
+              },
+              "darwin-x86_64": {
+                "signature": "${{ needs.build-macos.outputs.MAC_UNIVERSAL_SIG || '' }}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v$VERSION/${{ needs.build-macos.outputs.TAR_NAME || 'jan-mac-universal.tar.gz' }}"
+              }
+            }
+          }
+          EOF
+          cat latest.json
+
+      - name: Upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v${{ needs.pre-release-checks.outputs.version }} latest.json --clobber
+
+  # Release Summary
+  release-summary:
+    name: Release Summary
+    runs-on: ubuntu-latest
+    needs: [pre-release-checks, build-macos, build-windows, build-linux, build-web, create-update-manifest]
+    if: always()
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## Release v${{ needs.pre-release-checks.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | ${{ needs.build-macos.result == 'success' && '✅ Built' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | ${{ needs.build-windows.result == 'success' && '✅ Built' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | ${{ needs.build-linux.result == 'success' && '✅ Built' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Web App | ${{ needs.build-web.result == 'success' && '✅ Built' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Channel:** ${{ needs.pre-release-checks.outputs.channel }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,227 @@
+name: Release Mobile Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.6.600)'
+        required: true
+        type: string
+      platform:
+        description: 'Platform to build'
+        required: true
+        type: choice
+        options:
+          - both
+          - android
+          - ios
+        default: both
+      channel:
+        description: 'Release channel'
+        required: true
+        type: choice
+        options:
+          - internal
+          - beta
+          - production
+        default: internal
+
+env:
+  NODE_OPTIONS: '--max-old-space-size=4096'
+
+jobs:
+  # Android Build
+  build-android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    if: inputs.platform == 'both' || inputs.platform == 'android'
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yarn build:core
+          yarn build:extensions
+
+      - name: Initialize Android
+        run: |
+          if [ ! -d "src-tauri/gen/android" ]; then
+            yarn tauri android init
+          fi
+
+      - name: Build Android APK
+        run: yarn build:android
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+
+      - name: Sign APK
+        if: env.ANDROID_KEYSTORE != ''
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > release.keystore
+          $ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner sign \
+            --ks release.keystore \
+            --ks-key-alias ${{ secrets.ANDROID_KEY_ALIAS }} \
+            --ks-pass pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
+            --key-pass pass:${{ secrets.ANDROID_KEY_PASSWORD }} \
+            src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+          retention-days: 30
+
+      - name: Upload to Play Store (Internal)
+        if: inputs.channel == 'internal' && secrets.GOOGLE_PLAY_SERVICE_ACCOUNT != ''
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          packageName: ai.jan.app
+          releaseFiles: src-tauri/gen/android/app/build/outputs/bundle/universalRelease/*.aab
+          track: internal
+          status: completed
+
+  # iOS Build
+  build-ios:
+    name: Build iOS
+    runs-on: macos-14
+    if: inputs.platform == 'both' || inputs.platform == 'ios'
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yarn build:core
+          yarn build:extensions
+
+      - name: Initialize iOS
+        run: |
+          if [ ! -d "src-tauri/gen/ios" ]; then
+            yarn tauri ios init
+          fi
+
+      - name: Install Apple Certificate
+        if: secrets.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+      - name: Install Provisioning Profile
+        if: secrets.APPLE_PROVISIONING_PROFILE != ''
+        env:
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$APPLE_PROVISIONING_PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+      - name: Build iOS
+        run: yarn build:ios
+        env:
+          IS_IOS: true
+
+      - name: Build iOS IPA
+        run: |
+          cd src-tauri/gen/ios
+          xcodebuild -workspace Jan.xcworkspace \
+            -scheme Jan \
+            -configuration Release \
+            -archivePath build/Jan.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="${{ secrets.APPLE_CODE_SIGN_IDENTITY }}" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}"
+
+          xcodebuild -exportArchive \
+            -archivePath build/Jan.xcarchive \
+            -exportPath build \
+            -exportOptionsPlist exportOptions.plist
+        continue-on-error: true
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-app
+          path: |
+            src-tauri/gen/ios/build/*.ipa
+            src-tauri/gen/ios/build/*.xcarchive
+          retention-days: 30
+
+  # Release Summary
+  mobile-release-summary:
+    name: Mobile Release Summary
+    runs-on: ubuntu-latest
+    needs: [build-android, build-ios]
+    if: always()
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## Mobile Release v${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Android | ${{ needs.build-android.result == 'success' && '✅ Built' || (needs.build-android.result == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| iOS | ${{ needs.build-ios.result == 'success' && '✅ Built' || (needs.build-ios.result == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Channel:** ${{ inputs.channel }}" >> $GITHUB_STEP_SUMMARY
