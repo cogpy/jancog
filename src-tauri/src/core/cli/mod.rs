@@ -561,6 +561,7 @@ pub fn cli_agent_config_set(
     models: Option<Vec<String>>,
     api_type: Option<String>,
 ) -> Result<PathBuf, String> {
+    let updates_key = api_key.is_some();
     crate::core::agent::global_config::set_provider(
         provider,
         crate::core::agent::global_config::ProviderUpdate {
@@ -568,7 +569,12 @@ pub fn cli_agent_config_set(
             base_url,
             models,
             api_type,
-            ..Default::default()
+            // A new key (or explicit clear) must not inherit the prior key's
+            // metadata: it would make `auth status` and logout describe/revoke
+            // the wrong key.
+            key_id: updates_key.then_some(None),
+            key_expires_at: updates_key.then_some(None),
+            account: updates_key.then_some(None),
         },
     )
 }

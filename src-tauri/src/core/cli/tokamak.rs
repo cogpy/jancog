@@ -86,12 +86,11 @@ pub fn sanitize_key(raw: &str) -> Result<String, String> {
 /// Verify `api_key` against Tokamak and return the model ids it grants access
 /// to. An empty list is a valid answer (the account has no models yet), so the
 /// caller decides whether that is usable.
-async fn verify_key(api_key: &str) -> Result<Vec<String>, String> {
+async fn verify_key(api_key: &str, root: &str) -> Result<Vec<String>, String> {
     let client = reqwest::Client::builder()
         .timeout(VERIFY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
-    let root = base_url();
     let response = client
         .get(format!("{root}/models"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -113,7 +112,7 @@ async fn verify_key(api_key: &str) -> Result<Vec<String>, String> {
 /// when verification fails, so a typo never leaves a broken entry behind.
 pub async fn login(api_key: &str) -> Result<Login, String> {
     let api_key = sanitize_key(api_key)?;
-    let models = verify_key(&api_key).await?;
+    let models = verify_key(&api_key, &base_url()).await?;
     persist(&api_key, models)
 }
 
@@ -160,7 +159,7 @@ pub(crate) async fn device_login(
     pending: super::device_auth::PendingAuth,
 ) -> Result<Login, String> {
     let minted = pending.claim().await?;
-    let models = verify_key(&minted.api_key).await?;
+    let models = verify_key(&minted.api_key, &base_url()).await?;
     persist_minted(&minted, models)
 }
 
@@ -247,6 +246,20 @@ fn stored_api_key() -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
+fn stored_base_url() -> Option<String> {
+    use crate::core::agent::global_config::load_global_config;
+    load_global_config()
+        .ok()?
+        .get(PROVIDER)
+        .and_then(|c| c.base_url.clone())
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+fn effective_base_url() -> String {
+    stored_base_url().unwrap_or_else(base_url)
+}
+
 /// Revoke `key_id` server-side, authenticating with the key itself. Best-effort
 /// by contract -- logout must never be blocked by this call -- so the result is
 /// a plain "did it land", never an error.
@@ -258,7 +271,7 @@ async fn revoke_key(key_id: &str, api_key: &str) -> bool {
     let Ok(client) = reqwest::Client::builder().timeout(VERIFY_TIMEOUT).build() else {
         return false;
     };
-    let root = super::device_auth::api_root(&base_url());
+    let root = super::device_auth::api_root(&effective_base_url());
     client
         .delete(format!("{root}/auth/api-keys/{key_id}"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -284,7 +297,7 @@ pub fn auth_status() -> AuthStatus {
     let meta = provider_key_meta(PROVIDER).unwrap_or_default();
     AuthStatus {
         signed_in: stored_api_key().is_some(),
-        endpoint: base_url(),
+        endpoint: effective_base_url(),
         account: meta.account,
         key_id: meta.key_id,
         key_expires_at: meta.key_expires_at,
@@ -354,7 +367,7 @@ pub async fn live_valid() -> Option<bool> {
     if key.is_empty() {
         return Some(false);
     }
-    match verify_key(&key).await {
+    match verify_key(&key, &effective_base_url()).await {
         // A 401/403 is an invalid key; a network blip should not read as one.
         Ok(_) => Some(true),
         Err(e) if e.contains("could not reach") => None,
